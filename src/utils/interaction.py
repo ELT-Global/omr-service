@@ -2,20 +2,38 @@ from dataclasses import dataclass
 
 import cv2
 from screeninfo import get_monitors
+from screeninfo.common import ScreenInfoError
 
 from src.logger import logger
 from src.utils.image import ImageUtils
 
-monitor_window = get_monitors()[0]
+
+def get_monitor_dimensions():
+    """Get monitor dimensions, with fallback for headless environments"""
+    try:
+        monitor = get_monitors()[0]
+        return monitor.width, monitor.height
+    except (ScreenInfoError, IndexError):
+        # Fallback for headless environments (Docker, CI/CD, etc.)
+        logger.warning("No display detected. Using default dimensions for headless mode.")
+        return 1920, 1080  # Default fallback dimensions
 
 
 @dataclass
 class ImageMetrics:
     # TODO: Move TEXT_SIZE, etc here and find a better class name
-    window_width, window_height = monitor_window.width, monitor_window.height
+    window_width: int = None
+    window_height: int = None
     # for positioning image windows
-    window_x, window_y = 0, 0
-    reset_pos = [0, 0]
+    window_x: int = 0
+    window_y: int = 0
+    reset_pos: list = None
+    
+    def __post_init__(self):
+        if self.window_width is None or self.window_height is None:
+            self.window_width, self.window_height = get_monitor_dimensions()
+        if self.reset_pos is None:
+            self.reset_pos = [0, 0]
 
 
 class InteractionUtils:

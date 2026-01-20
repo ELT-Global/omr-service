@@ -1,19 +1,13 @@
 [phases.setup]
 aptPkgs = [
-    "libxcb1",
-    "libxcb-xkb1", 
-    "libxcb-render0",
-    "libxcb-shm0",
-    "libxcb-icccm4",
-    "libxcb-image0",
-    "libxcb-keysyms1",
-    "libxcb-randr0",
-    "libxcb-shape0",
-    "libglib2.0-0",
+    "ffmpeg",
     "libsm6",
     "libxext6",
     "libxrender1",
+    "libglib2.0-0",
     "libgomp1",
-    "libgl1",
-    "ffmpeg"
+    "libgl1"
 ]
+
+[start]
+cmd = "MPLBACKEND=Agg python main.py"
