@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Simple test script for OMRChecker API without custom config
+Simple test script for OMR Processing API without custom config
 
 This script demonstrates that config.json and template.json are optional.
 The API will use the default configuration automatically.
@@ -12,14 +12,14 @@ from pathlib import Path
 API_URL = "http://localhost:8000"
 
 
-def test_parse_with_defaults(image_path: str, user_id: str = "test_user_001"):
+def test_process_with_defaults(image_path: str, sheet_id: str = "test_sheet_001"):
     """
-    Test the parse-omr endpoint WITHOUT providing config or template.
+    Test the /process-sheet endpoint WITHOUT providing config or template.
     The API will use default config automatically.
     """
-    print(f"Testing /parse-omr with default config...")
+    print(f"Testing /process-sheet with default config...")
     print(f"Image: {image_path}")
-    print(f"User ID: {user_id}")
+    print(f"Sheet ID: {sheet_id}")
     print()
     
     if not Path(image_path).exists():
@@ -27,19 +27,19 @@ def test_parse_with_defaults(image_path: str, user_id: str = "test_user_001"):
         return False
     
     with open(image_path, 'rb') as img_file:
-        # Notice: We're ONLY sending image and userId
+        # Notice: We're ONLY sending image and sheet_id
         # No config_json or template_json needed!
         files = {"image": img_file}
-        data = {"userId": user_id}
+        data = {"sheet_id": sheet_id}
         
-        response = requests.post(f"{API_URL}/parse-omr", files=files, data=data)
+        response = requests.post(f"{API_URL}/process-sheet", files=files, data=data)
         
         print(f"Status: {response.status_code}")
         
         if response.status_code == 200:
             result = response.json()
             print(f"✓ Success! Using default config/template")
-            print(f"\nUser ID: {result['id']}")
+            print(f"\nSheet ID: {result['id']}")
             print(f"Multi-marked count: {result['multi_marked_count']}")
             print(f"\nDetected answers:")
             for key, value in result['answers'].items():
@@ -54,7 +54,7 @@ def test_parse_with_defaults(image_path: str, user_id: str = "test_user_001"):
 
 def main():
     print("=" * 70)
-    print("OMRChecker API - Simple Test (Using Default Config)")
+    print("OMR Processing API - Simple Test (Using Default Config)")
     print("=" * 70)
     print()
     print("This test demonstrates that config.json and template.json are OPTIONAL")
@@ -77,7 +77,7 @@ def main():
     
     # Test with the first image - NO config/template provided!
     test_image = image_files[0]
-    success = test_parse_with_defaults(str(test_image))
+    success = test_process_with_defaults(str(test_image))
     
     if success:
         print("=" * 70)
@@ -97,6 +97,6 @@ def main():
 if __name__ == "__main__":
     if len(sys.argv) > 1:
         # Use provided image path
-        test_parse_with_defaults(sys.argv[1])
+        test_process_with_defaults(sys.argv[1])
     else:
         main()

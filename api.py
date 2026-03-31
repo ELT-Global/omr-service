@@ -1,189 +1,103 @@
 """
-FastAPI server for OMRChecker
+Simplified OMR Processing API - Stateless & Pure
 
-This module provides RESTful API endpoints to process OMR sheets.
+A minimal REST API providing two endpoints:
+1. /process-sheet - Process a single OMR sheet
+2. /process-batch - Process up to 20 OMR sheets synchronously
+
+No authentication, no database, no job tracking - just pure OMR processing.
 """
 import os
 import tempfile
 import json
-import httpx
+import base64
+import binascii
+import asyncio
 from pathlib import Path
 from typing import Optional, List
 
+import httpx
 import uvicorn
-from fastapi import FastAPI, File, Form, UploadFile, HTTPException, Depends, BackgroundTasks
+from fastapi import FastAPI, File, Form, UploadFile, HTTPException
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from src.api_utils import process_single_omr_image
-from src.api.auth import get_current_operator
-from src.database.models import Operator
-from src.database import db_connection, DatabaseSchema
 from src.logger import logger
-from src.services.parsing_job_service import ParsingJobService
-from src.workers.background_processor import get_background_processor
+
 
 # Initialize FastAPI app
 app = FastAPI(
-    title="OMRChecker API",
+    title="OMR Processing API",
     description="""
-API for processing Optical Mark Recognition (OMR) sheets.
+Simple, stateless API for processing Optical Mark Recognition (OMR) sheets.
 
-## Authentication
+## Endpoints
 
-All endpoints (except /health and /) require HTTP Basic Authentication.
+- **POST /process-sheet**: Process a single OMR sheet
+- **POST /process-batch**: Process up to 20 OMR sheets synchronously
 
-### Using Swagger UI:
-1. Click the **"Authorize" 🔓** button at the top right
-2. **Username**: Enter anything (e.g., "api" or "user") - this field is ignored
-3. **Password**: Enter your operator UUID (e.g., "test-uuid")
-4. Click **"Authorize"** and then **"Close"**
-5. Now all your API requests will include the authentication automatically!
-
-### Using curl:
-```bash
-# Option 1: Using -u flag (recommended)
-curl -u "api:test-uuid" \\
-  -X POST "http://localhost:8000/omr:parse-sheet" \\
-  -F "userId=student_001" \\
-  -F "image=@sheet.jpg"
-
-# Option 2: Manual Authorization header
-curl -X POST "http://localhost:8000/omr:parse-sheet" \\
-  -H "Authorization: Basic $(echo -n 'api:test-uuid' | base64)" \\
-  -F "userId=student_001" \\
-  -F "image=@sheet.jpg"
-```
-
-### Using Python requests:
-```python
-import requests
-
-response = requests.post(
-    "http://localhost:8000/omr:parse-sheet",
-    auth=("api", "test-uuid"),  # (username, password/UUID)
-    data={"userId": "student_001"},
-    files={"image": open("sheet.jpg", "rb")}
-)
-print(response.json())
-```
-
-### Using JavaScript/fetch:
-```javascript
-const auth = btoa('api:test-uuid'); // Base64 encode
-fetch('http://localhost:8000/omr:parse-sheet', {
-  method: 'POST',
-  headers: {
-    'Authorization': `Basic ${auth}`
-  },
-  body: formData
-});
-```
-
-**Note**: Contact your administrator to obtain an operator UUID.
+No authentication required. All processing is synchronous and stateless.
     """,
-    version="1.0.0",
+    version="2.0.0",
 )
-
-
-# Database initialization on startup
-@app.on_event("startup")
-async def startup_event():
-    """Initialize database on application startup"""
-    logger.info("Initializing database...")
-    try:
-        conn = db_connection.get_connection()
-        DatabaseSchema.initialize_database(conn)
-        logger.info("Database initialized successfully")
-    except Exception as e:
-        logger.error(f"Failed to initialize database: {e}")
-        raise
 
 
 # Response models
-class OMRResponse(BaseModel):
-    """Response model for OMR processing"""
-    id: str
-    answers: dict
-    multi_marked_count: int
+class OMRResult(BaseModel):
+    """Result model for a single OMR sheet"""
+    id: str = Field(..., description="Sheet identifier")
+    answers: dict = Field(..., description="Detected answers")
+    multi_marked_count: int = Field(..., description="Number of multi-marked questions")
+    error: Optional[str] = Field(None, description="Error message if processing failed")
 
 
-class SheetItem(BaseModel):
-    """Model for individual sheet in parse-sheets request"""
-    id: str = Field(..., description="Unique identifier for the sheet")
-    image_url: str = Field(..., description="URL of the OMR sheet image")
+class BatchRequest(BaseModel):
+    """Request model for batch processing"""
+    sheets: List[dict] = Field(
+        ...,
+        description="Array of sheets to process. Each sheet must have 'id' and either 'image_url' or 'image_base64'",
+        min_length=1,
+        max_length=20
+    )
+    config_json: Optional[str] = Field(None, description="Optional custom config.json as JSON string")
+    template_json: Optional[str] = Field(None, description="Optional custom template.json as JSON string")
 
-
-class ParseSheetsRequest(BaseModel):
-    """Request model for bulk OMR parsing"""
-    items: List[SheetItem] = Field(..., description="Array of sheets to process", min_items=1)
-    config_json: Optional[str] = Field(None, description="Optional: Custom config.json content as JSON string. If not provided, uses default config.")
-    template_json: Optional[str] = Field(None, description="Optional: Custom template.json content as JSON string. If not provided, uses default template.")
+    @field_validator('sheets')
+    @classmethod
+    def validate_sheets(cls, sheets):
+        if len(sheets) > 20:
+            raise ValueError("Maximum 20 sheets allowed per batch")
+        
+        for i, sheet in enumerate(sheets):
+            if 'id' not in sheet:
+                raise ValueError(f"Sheet at index {i} missing required field 'id'")
+            if 'image_url' not in sheet and 'image_base64' not in sheet:
+                raise ValueError(f"Sheet at index {i} must have either 'image_url' or 'image_base64'")
+            if 'image_url' in sheet and 'image_base64' in sheet:
+                raise ValueError(f"Sheet at index {i} cannot have both 'image_url' and 'image_base64'")
+        
+        return sheets
 
     class Config:
         json_schema_extra = {
             "example": {
-                "items": [
+                "sheets": [
                     {"id": "student_001", "image_url": "https://example.com/sheet1.jpg"},
-                    {"id": "student_002", "image_url": "https://example.com/sheet2.jpg"}
+                    {"id": "student_002", "image_base64": "iVBORw0KGgoAAAANSUhEUg..."}
                 ],
-                "config_json": {"some_config_key": "some_value"},
-                "template_json": {"some_template_key": "some_value"}
+                "config_json": None,
+                "template_json": None
             }
         }
 
 
-class BulkOMRItem(BaseModel):
-    """Model for bulk OMR processing item"""
-    id: str
-    image_url: Optional[str] = None
-    error: Optional[str] = None
-    answers: Optional[dict] = None
-    multi_marked_count: Optional[int] = None
-
-
-class BulkOMRResponse(BaseModel):
-    """Response model for bulk OMR processing"""
-    total: int
-    successful: int
-    failed: int
-    results: List[BulkOMRItem]
-
-
-class ErrorResponse(BaseModel):
-    """Error response model"""
-    error: str
-    detail: Optional[str] = None
-
-
-class JobResponse(BaseModel):
-    """Response model for job creation"""
-    jobId: str
-    status: str
-
-
-class SheetStatusResponse(BaseModel):
-    """Model for sheet status in job details"""
-    id: str
-    image_url: str
-    status: str
-    answers: Optional[dict] = None
-    error: Optional[str] = None
-
-
-class JobDetailsResponse(BaseModel):
-    """Response model for job details"""
-    jobId: str
-    status: str
-    totalSheets: int
-    processedSheets: int
-    successfulSheets: int
-    failedSheets: int
-    pendingSheets: int
-    callbackStatus: str
-    createdAt: str
-    completedAt: Optional[str] = None
-    sheets: Optional[List[SheetStatusResponse]] = None
+class BatchResponse(BaseModel):
+    """Response model for batch processing"""
+    total: int = Field(..., description="Total number of sheets in the batch")
+    successful: int = Field(..., description="Number of successfully processed sheets")
+    failed: int = Field(..., description="Number of failed sheets")
+    results: List[OMRResult] = Field(..., description="Results for each sheet")
 
 
 # Default configuration directory (can be overridden via environment variable)
@@ -194,6 +108,13 @@ DEFAULT_CONFIG_DIR = Path(os.getenv(
 
 
 # Helper functions
+
+def _save_temp_file(content: bytes, suffix: str) -> str:
+    """Synchronous helper to save content to a temp file."""
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as temp_file:
+        temp_file.write(content)
+        return temp_file.name
+
 async def download_image_from_url(url: str) -> str:
     """
     Download an image from a URL and save it temporarily.
@@ -221,10 +142,8 @@ async def download_image_from_url(url: str) -> str:
             else:
                 ext = '.jpg'  # default
             
-            # Save to temporary file
-            with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as temp_file:
-                temp_file.write(response.content)
-                return temp_file.name
+            # Save to temporary file asynchronously
+            return await asyncio.to_thread(_save_temp_file, response.content, ext)
                 
     except httpx.HTTPError as e:
         raise HTTPException(
@@ -238,7 +157,53 @@ async def download_image_from_url(url: str) -> str:
         )
 
 
-async def save_config_files(config_json: Optional[str], template_json: Optional[str]) -> Optional[str]:
+def decode_base64_image(base64_string: str) -> str:
+    """
+    Decode a base64 image string and save it temporarily.
+    
+    Args:
+        base64_string: Base64 encoded image data (with or without data URI prefix)
+        
+    Returns:
+        str: Path to the temporary file
+        
+    Raises:
+        HTTPException: If decoding fails
+    """
+    try:
+        # Remove data URI prefix if present (e.g., "data:image/jpeg;base64,")
+        if ',' in base64_string and base64_string.startswith('data:'):
+            base64_string = base64_string.split(',', 1)[1]
+        
+        # Decode base64
+        image_data = base64.b64decode(base64_string)
+        
+        # Determine file extension from image data signature
+        if image_data.startswith(b'\xff\xd8\xff'):
+            ext = '.jpg'
+        elif image_data.startswith(b'\x89PNG'):
+            ext = '.png'
+        else:
+            ext = '.jpg'  # default
+        
+        # Save to temporary file
+        with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as temp_file:
+            temp_file.write(image_data)
+            return temp_file.name
+            
+    except binascii.Error as e:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid base64 image data: {str(e)}"
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error decoding base64 image: {str(e)}"
+        )
+
+
+def save_config_files(config_json: Optional[str], template_json: Optional[str]) -> Optional[str]:
     """
     Save custom config and template JSON to a temporary directory.
     
@@ -275,67 +240,79 @@ async def save_config_files(config_json: Optional[str], template_json: Optional[
         )
 
 
+def cleanup_temp_files(*paths):
+    """Clean up temporary files and directories"""
+    import shutil
+    for path in paths:
+        if path and os.path.exists(path):
+            try:
+                if os.path.isdir(path):
+                    shutil.rmtree(path)
+                else:
+                    os.unlink(path)
+            except Exception as e:
+                logger.warning(f"Failed to delete temporary file {path}: {e}")
+
+
+# API Endpoints
 @app.get("/", tags=["Health"])
 async def root():
     """Root endpoint - API health check"""
     return {
-        "message": "OMRChecker API is running",
-        "version": "1.0.0",
-        "docs": "/docs",
-        "redoc": "/redoc"
+        "message": "OMR Processing API is running",
+        "version": "2.0.0",
+        "endpoints": {
+            "/process-sheet": "Process a single OMR sheet",
+            "/process-batch": "Process up to 20 OMR sheets synchronously"
+        }
     }
 
 
 @app.post(
-    "/omr:parse-sheet",
-    response_model=OMRResponse,
+    "/process-sheet",
+    response_model=OMRResult,
     tags=["OMR Processing"],
-    summary="Parse OMR Sheet",
-    description="Upload an OMR sheet image or provide a URL, and get the detected answers in JSON format. Requires authentication."
+    summary="Process Single OMR Sheet",
+    description="Process a single OMR sheet and return detected answers immediately."
 )
-async def parse_omr(
-    userId: str = Form(..., description="Unique identifier for the sheet"),
-    operator: Operator = Depends(get_current_operator),
+async def process_sheet(
+    sheet_id: str = Form(..., description="Unique identifier for the sheet"),
     image: Optional[UploadFile] = File(None, description="OMR sheet image file (JPG, PNG, etc.)"),
-    image_url: Optional[str] = Form(None, description="URL of the OMR sheet image (alternative to file upload)"),
-    config_json: Optional[str] = Form(None, description="Optional: Custom config.json content as JSON string. If not provided, uses default config."),
-    template_json: Optional[str] = Form(None, description="Optional: Custom template.json content as JSON string. If not provided, uses default template.")
+    image_url: Optional[str] = Form(None, description="URL of the OMR sheet image"),
+    image_base64: Optional[str] = Form(None, description="Base64 encoded image data"),
+    config_json: Optional[str] = Form(None, description="Optional custom config.json as JSON string"),
+    template_json: Optional[str] = Form(None, description="Optional custom template.json as JSON string")
 ):
     """
-    Parse an OMR sheet and return detected answers.
+    Process a single OMR sheet.
     
-    **Authentication Required**: Include Authorization header with Basic <operator_uuid>
+    - **sheet_id**: Unique identifier for this sheet (returned in response)
+    - **image**: The OMR sheet image file (one of image/image_url/image_base64 required)
+    - **image_url**: URL to download the OMR sheet image
+    - **image_base64**: Base64 encoded image data (with or without data URI prefix)
+    - **config_json**: OPTIONAL - Custom config.json as JSON string
+    - **template_json**: OPTIONAL - Custom template.json as JSON string
     
-    - **userId**: Unique identifier for this sheet (returned in response)
-    - **image**: The OMR sheet image file to process (either this or image_url required)
-    - **image_url**: URL to download the OMR sheet image (either this or image required)
-    - **config_json**: OPTIONAL - Custom config.json as JSON string. If omitted, uses default config.
-    - **template_json**: OPTIONAL - Custom template.json as JSON string. If omitted, uses default template.
-    
-    Note: config_json and template_json are optional. When not provided, the API uses a default
-    configuration from the samples directory (configurable via OMR_DEFAULT_CONFIG_DIR environment variable).
-    
-    Returns the detected answers as a JSON object.
+    Returns the detected answers immediately.
     """
     
-    # Operator is now available for future use (e.g., saving to database)
-    logger.info(f"Processing OMR for operator_id: {operator.id}, userId: {userId}")
+    # Validate that exactly one image source is provided
+    provided_sources = sum([bool(image), bool(image_url), bool(image_base64)])
     
-    # Validate that either image or image_url is provided
-    if not image and not image_url:
+    if provided_sources == 0:
         raise HTTPException(
             status_code=400,
-            detail="Either 'image' file or 'image_url' must be provided"
+            detail="One of 'image', 'image_url', or 'image_base64' must be provided"
         )
     
-    if image and image_url:
+    if provided_sources > 1:
         raise HTTPException(
             status_code=400,
-            detail="Provide either 'image' file or 'image_url', not both"
+            detail="Provide only one of 'image', 'image_url', or 'image_base64'"
         )
     
     # Validate file type if image is provided
-    if image and hasattr(image, 'content_type') and not image.content_type.startswith('image/'):
+    if image and hasattr(image, 'content_type') and image.content_type and not image.content_type.startswith('image/'):
         raise HTTPException(
             status_code=400,
             detail=f"Invalid file type: {image.content_type}. Please upload an image file."
@@ -345,21 +322,28 @@ async def parse_omr(
     custom_config_dir = None
     
     try:
-        # Get image (either from upload or URL)
+        # Get image (from upload, URL, or base64)
         if image:
             # Save uploaded file temporarily
-            with tempfile.NamedTemporaryFile(delete=False, suffix=Path(image.filename).suffix) as temp_file:
-                content = await image.read()
-                temp_file.write(content)
-                temp_image_path = temp_file.name
-        else:
+            suffix = Path(image.filename).suffix if image.filename else '.jpg'
+            content = await image.read()
+            temp_image_path = await asyncio.to_thread(_save_temp_file, content, suffix)
+        elif image_url:
             # Download from URL
             temp_image_path = await download_image_from_url(image_url)
+        elif image_base64:
+            # Decode from base64
+            temp_image_path = decode_base64_image(image_base64)
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail="No image source provided"
+            )
         
-        # logger.info removed from here - moved to top with operator context
+        logger.info(f"Processing OMR for sheet_id: {sheet_id}")
         
         # Save custom config files if provided
-        custom_config_dir = await save_config_files(config_json, template_json)
+        custom_config_dir = save_config_files(config_json, template_json)
         
         # Determine which config directory to use
         config_dir = custom_config_dir if custom_config_dir else str(DEFAULT_CONFIG_DIR)
@@ -370,278 +354,126 @@ async def parse_omr(
             config_dir=config_dir
         )
         
-        logger.info(f"Successfully processed OMR for operator_id: {operator.id}, userId: {userId}")
+        logger.info(f"Successfully processed OMR for sheet_id: {sheet_id}")
         
-        return OMRResponse(
-            id=userId,
+        return OMRResult(
+            id=sheet_id,
             answers=result["response"],
-            multi_marked_count=result["multi_marked_count"]
+            multi_marked_count=result["multi_marked_count"],
+            error=None
         )
         
     except Exception as e:
-        logger.error(f"Error processing OMR for operator_id: {operator.id}, userId {userId}: {str(e)}")
-        raise HTTPException(
-            status_code=500,
-            detail=f"Error processing OMR image: {str(e)}"
+        logger.error(f"Error processing OMR for sheet_id {sheet_id}: {str(e)}")
+        return OMRResult(
+            id=sheet_id,
+            answers={},
+            multi_marked_count=0,
+            error=str(e)
         )
     
     finally:
         # Clean up temporary files
-        if temp_image_path and os.path.exists(temp_image_path):
-            try:
-                os.unlink(temp_image_path)
-            except Exception as e:
-                logger.warning(f"Failed to delete temporary image file: {e}")
-        
-        if custom_config_dir and os.path.exists(custom_config_dir):
-            try:
-                import shutil
-                shutil.rmtree(custom_config_dir)
-            except Exception as e:
-                logger.warning(f"Failed to delete temporary file: {e}")
+        cleanup_temp_files(temp_image_path, custom_config_dir)
 
 
 @app.post(
-    "/omr:parse-sheets",
-    response_model=JobResponse,
+    "/process-batch",
+    response_model=BatchResponse,
     tags=["OMR Processing"],
-    summary="Parse Multiple OMR Sheets (Async)",
-    description="Process multiple OMR sheets asynchronously. Creates a parsing job and returns immediately. Use /jobs/{jobId} to check status. Requires authentication."
+    summary="Process Multiple OMR Sheets Synchronously",
+    description="Process up to 20 OMR sheets synchronously. Returns results for all sheets immediately."
 )
-async def parse_omr_bulk(
-    background_tasks: BackgroundTasks,
-    request: ParseSheetsRequest,
-    operator: Operator = Depends(get_current_operator)
-):
+async def process_batch(request: BatchRequest):
     """
-    Parse multiple OMR sheets asynchronously.
+    Process multiple OMR sheets synchronously (max 20 sheets).
     
-    **Authentication Required**: Include Authorization header with Basic <operator_uuid>
-    
-    **Request Body**: JSON object with the following fields:
-    - **items**: Array of sheet objects, each containing:
+    **Request Body**: JSON object with:
+    - **sheets**: Array of sheet objects (max 20), each with:
       - **id**: Unique identifier for the sheet (required)
-      - **image_url**: URL of the OMR sheet image (required)
-    - **config_json**: OPTIONAL - Custom config.json as JSON string (applies to all sheets). If omitted, uses default config.
-    - **template_json**: OPTIONAL - Custom template.json as JSON string (applies to all sheets). If omitted, uses default template.
+      - **image_url**: URL of the OMR sheet image (either this or image_base64)
+      - **image_base64**: Base64 encoded image data (either this or image_url)
+    - **config_json**: OPTIONAL - Custom config.json as JSON string (applies to all sheets)
+    - **template_json**: OPTIONAL - Custom template.json as JSON string (applies to all sheets)
     
-    **Example Request Body**:
-    ```json
-    {
-      "items": [
-        {"id": "student_001", "image_url": "https://example.com/sheet1.jpg"},
-        {"id": "student_002", "image_url": "https://example.com/sheet2.jpg"}
-      ],
-      "config_json": null,
-      "template_json": null
-    }
-    ```
-    
-    Returns a job ID immediately. The job will be processed in the background.
-    Check job status using GET /jobs/{jobId}.
-    A webhook will be sent to your registered webhook_url upon completion.
+    You can mix image_url and image_base64 in the same batch.
+    Returns results for all sheets immediately. Processing happens synchronously.
     """
     
     custom_config_dir = None
+    temp_image_paths = []
     
     try:
-        # Extract validated data from request
-        items_data = [item.dict() for item in request.items]
-        
-        logger.info(f"Creating parsing job for operator_id: {operator.id} with {len(items_data)} sheets")
+        logger.info(f"Processing batch of {len(request.sheets)} sheets")
         
         # Save custom config files if provided
-        custom_config_dir = await save_config_files(request.config_json, request.template_json)
+        custom_config_dir = save_config_files(request.config_json, request.template_json)
         config_dir = custom_config_dir if custom_config_dir else str(DEFAULT_CONFIG_DIR)
         
-        # Create parsing job with all sheets in database
-        job_service = ParsingJobService()
-        job = job_service.create_job(
-            operator_id=operator.id,
-            items=items_data,
-            config_dir=config_dir
-        )
+        # Process all sheets
+        results = []
+        successful = 0
+        failed = 0
         
-        # Submit job to background processor
-        background_processor = get_background_processor()
-        background_tasks.add_task(
-            background_processor.process_job,
-            job.id,
-            config_dir
-        )
+        for sheet in request.sheets:
+            sheet_id = sheet['id']
+            temp_image_path = None
+            
+            try:
+                # Get image (from URL or base64)
+                if 'image_url' in sheet:
+                    temp_image_path = await download_image_from_url(sheet['image_url'])
+                else:
+                    temp_image_path = decode_base64_image(sheet['image_base64'])
+                
+                temp_image_paths.append(temp_image_path)
+                
+                # Process the OMR image
+                result = process_single_omr_image(
+                    image_path=temp_image_path,
+                    config_dir=config_dir
+                )
+                
+                results.append(OMRResult(
+                    id=sheet_id,
+                    answers=result["response"],
+                    multi_marked_count=result["multi_marked_count"],
+                    error=None
+                ))
+                successful += 1
+                logger.info(f"Successfully processed sheet: {sheet_id}")
+                
+            except Exception as e:
+                logger.error(f"Error processing sheet {sheet_id}: {str(e)}")
+                results.append(OMRResult(
+                    id=sheet_id,
+                    answers={},
+                    multi_marked_count=0,
+                    error=str(e)
+                ))
+                failed += 1
         
-        logger.info(f"Parsing job {job.id} created and submitted for background processing")
+        logger.info(f"Batch processing complete: {successful} successful, {failed} failed")
         
-        return JobResponse(
-            jobId=job.id,
-            status=job.status.value
+        return BatchResponse(
+            total=len(request.sheets),
+            successful=successful,
+            failed=failed,
+            results=results
         )
         
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error creating parsing job: {str(e)}")
+        logger.error(f"Error in batch processing: {str(e)}")
         raise HTTPException(
             status_code=500,
-            detail=f"Error creating parsing job: {str(e)}"
+            detail=f"Error processing batch: {str(e)}"
         )
     
     finally:
-        # Note: We can't clean up custom_config_dir here because background task needs it
-        # Background processor will need to handle cleanup or we keep it until job completes
-        pass
-
-
-@app.get(
-    "/jobs/{job_id}",
-    response_model=JobDetailsResponse,
-    tags=["Job Management"],
-    summary="Get Job Status",
-    description="Retrieve detailed status and results of a parsing job. Requires authentication."
-)
-async def get_job_status(
-    job_id: str,
-    operator: Operator = Depends(get_current_operator),
-    include_sheets: bool = False
-):
-    """
-    Get parsing job status and details.
-    
-    **Authentication Required**: Include Authorization header with Basic <operator_uuid>
-    
-    - **job_id**: The job identifier returned from /omr:parse-sheets
-    - **include_sheets**: Whether to include detailed sheet results (default: False)
-    
-    Returns job status, progress, and optionally detailed sheet results.
-    """
-    job_service = ParsingJobService()
-    
-    # Get job
-    job = job_service.get_job(job_id)
-    if not job:
-        raise HTTPException(
-            status_code=404,
-            detail=f"Job {job_id} not found"
-        )
-    
-    # Verify job belongs to operator
-    if job.operator_id != operator.id:
-        raise HTTPException(
-            status_code=403,
-            detail="Access denied: Job belongs to different operator"
-        )
-    
-    # Get sheets
-    sheets = job_service.get_job_sheets(job_id)
-    
-    # Calculate statistics
-    from src.database.models import SheetStatus
-    successful = sum(1 for s in sheets if s.status == SheetStatus.PARSED)
-    failed = sum(1 for s in sheets if s.status == SheetStatus.FAILED)
-    pending = sum(1 for s in sheets if s.status == SheetStatus.PENDING)
-    
-    # Prepare response
-    response = JobDetailsResponse(
-        jobId=job.id,
-        status=job.status.value,
-        totalSheets=job.total_sheets,
-        processedSheets=job.processed_sheets,
-        successfulSheets=successful,
-        failedSheets=failed,
-        pendingSheets=pending,
-        callbackStatus=job.callback_status.value,
-        createdAt=job.created_at.isoformat(),
-        completedAt=job.completed_at.isoformat() if job.completed_at else None
-    )
-    
-    # Include sheet details if requested
-    if include_sheets:
-        sheet_responses = []
-        for sheet in sheets:
-            sheet_data = SheetStatusResponse(
-                id=sheet.id,
-                image_url=sheet.image_url,
-                status=sheet.status.value
-            )
-            
-            if sheet.status == SheetStatus.PARSED and sheet.answered_options_json:
-                # Extract answers from stored data
-                data = sheet.answered_options_json
-                if isinstance(data, dict) and 'answers' in data:
-                    sheet_data.answers = data['answers']
-                else:
-                    sheet_data.answers = data
-            elif sheet.status == SheetStatus.FAILED:
-                sheet_data.error = sheet.error_message
-            
-            sheet_responses.append(sheet_data)
-        
-        response.sheets = sheet_responses
-    
-    return response
-
-
-@app.get(
-    "/jobs",
-    tags=["Job Management"],
-    summary="List Jobs",
-    description="List all parsing jobs for the authenticated operator. Requires authentication."
-)
-async def list_jobs(
-    operator: Operator = Depends(get_current_operator),
-    limit: int = 50,
-    status: Optional[str] = None
-):
-    """
-    List parsing jobs for the operator.
-    
-    **Authentication Required**: Include Authorization header with Basic <operator_uuid>
-    
-    - **limit**: Maximum number of jobs to return (default: 50, max: 200)
-    - **status**: Filter by status (PENDING, PROCESSING, COMPLETED, FAILED)
-    
-    Returns a list of jobs with summary information.
-    """
-    if limit > 200:
-        limit = 200
-    
-    job_service = ParsingJobService()
-    
-    # Get all jobs for operator
-    jobs = job_service.uow.parsing_jobs.find_by_operator(operator.id)
-    
-    # Filter by status if provided
-    if status:
-        from src.database.models import JobStatus
-        try:
-            status_enum = JobStatus(status.upper())
-            jobs = [j for j in jobs if j.status == status_enum]
-        except ValueError:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Invalid status: {status}. Must be one of: PENDING, PROCESSING, COMPLETED, FAILED"
-            )
-    
-    # Apply limit
-    jobs = jobs[:limit]
-    
-    # Format response
-    job_list = []
-    for job in jobs:
-        job_list.append({
-            'jobId': job.id,
-            'status': job.status.value,
-            'totalSheets': job.total_sheets,
-            'processedSheets': job.processed_sheets,
-            'callbackStatus': job.callback_status.value,
-            'createdAt': job.created_at.isoformat(),
-            'completedAt': job.completed_at.isoformat() if job.completed_at else None
-        })
-    
-    return {
-        'total': len(job_list),
-        'jobs': job_list
-    }
+        # Clean up all temporary files
+        cleanup_temp_files(custom_config_dir, *temp_image_paths)
 
 
 @app.get("/health", tags=["Health"])

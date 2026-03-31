@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Test script for OMRChecker API
+Test script for OMR Processing API
 
-This script tests the /parse-omr endpoint with a sample image.
+This script tests the /process-sheet endpoint with a sample image.
 """
 import requests
 import sys
@@ -21,9 +21,9 @@ def test_health_endpoint():
     return response.status_code == 200
 
 
-def test_parse_omr_endpoint(image_path: str, user_id: str = "test_user_001"):
-    """Test the parse-omr endpoint with an image"""
-    print(f"Testing /parse-omr endpoint with image: {image_path}")
+def test_process_sheet_endpoint(image_path: str, sheet_id: str = "test_sheet_001"):
+    """Test the process-sheet endpoint with an image"""
+    print(f"Testing /process-sheet endpoint with image: {image_path}")
     
     if not Path(image_path).exists():
         print(f"Error: Image file not found: {image_path}")
@@ -31,15 +31,15 @@ def test_parse_omr_endpoint(image_path: str, user_id: str = "test_user_001"):
     
     with open(image_path, 'rb') as img_file:
         files = {"image": img_file}
-        data = {"userId": user_id}
+        data = {"sheet_id": sheet_id}
         
-        response = requests.post(f"{API_URL}/parse-omr", files=files, data=data)
+        response = requests.post(f"{API_URL}/process-sheet", files=files, data=data)
         
         print(f"Status: {response.status_code}")
         
         if response.status_code == 200:
             result = response.json()
-            print(f"User ID: {result['id']}")
+            print(f"Sheet ID: {result['id']}")
             print(f"Multi-marked count: {result['multi_marked_count']}")
             print(f"Detected answers:")
             for key, value in result['answers'].items():
@@ -82,7 +82,7 @@ def main():
     
     # Test with the first image
     test_image = image_files[0]
-    if test_parse_omr_endpoint(str(test_image)):
+    if test_process_sheet_endpoint(str(test_image)):
         print("✓ API test successful!")
     else:
         print("✗ API test failed!")
@@ -92,6 +92,6 @@ def main():
 if __name__ == "__main__":
     if len(sys.argv) > 1:
         # Use provided image path
-        test_parse_omr_endpoint(sys.argv[1])
+        test_process_sheet_endpoint(sys.argv[1])
     else:
         main()

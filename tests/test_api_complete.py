@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-Comprehensive test script for OMRChecker API with all features
+Comprehensive test script for OMR Processing API
 
 This script tests:
 1. Single image upload
 2. Single image with URL
 3. Custom config/template
-4. Bulk processing
+4. Batch processing
 """
 import requests
 import json
@@ -25,14 +25,14 @@ def test_single_upload():
     
     with open(image_path, 'rb') as img_file:
         files = {"image": img_file}
-        data = {"userId": "test_upload_001"}
+        data = {"sheet_id": "test_upload_001"}
         
-        response = requests.post(f"{API_URL}/parse-omr", files=files, data=data)
+        response = requests.post(f"{API_URL}/process-sheet", files=files, data=data)
         
         print(f"Status Code: {response.status_code}")
         if response.status_code == 200:
             result = response.json()
-            print(f"✓ Success! User ID: {result['id']}")
+            print(f"✓ Success! Sheet ID: {result['id']}")
             print(f"  Multi-marked count: {result['multi_marked_count']}")
             print(f"  Sample answers: {dict(list(result['answers'].items())[:5])}")
             return True
@@ -51,8 +51,8 @@ def test_single_url():
     # For demo purposes, we'll skip this if no URL is available
     print("⊘ Skipped - requires public image URL")
     print("  Example usage:")
-    print("  curl -X POST http://localhost:8000/parse-omr \\")
-    print("    -F 'userId=test_url_001' \\")
+    print("  curl -X POST http://localhost:8000/process-sheet \\")
+    print("    -F 'sheet_id=test_url_001' \\")
     print("    -F 'image_url=https://example.com/omr-sheet.jpg'")
     return None
 
@@ -75,18 +75,18 @@ def test_custom_config():
     with open(image_path, 'rb') as img_file:
         files = {"image": img_file}
         data = {
-            "userId": "test_custom_config_001",
+            "sheet_id": "test_custom_config_001",
             "config_json": config_json,
             "template_json": template_json
         }
         
-        response = requests.post(f"{API_URL}/parse-omr", files=files, data=data)
+        response = requests.post(f"{API_URL}/process-sheet", files=files, data=data)
         
         print(f"Status Code: {response.status_code}")
         if response.status_code == 200:
             result = response.json()
             print(f"✓ Success! Custom config applied")
-            print(f"  User ID: {result['id']}")
+            print(f"  Sheet ID: {result['id']}")
             print(f"  Multi-marked count: {result['multi_marked_count']}")
             return True
         else:
@@ -94,33 +94,32 @@ def test_custom_config():
             return False
 
 
-def test_bulk_processing():
-    """Test bulk processing endpoint"""
+def test_batch_processing():
+    """Test batch processing endpoint"""
     print("\n" + "="*60)
-    print("TEST 4: Bulk Processing")
+    print("TEST 4: Batch Processing (max 20 sheets)")
     print("="*60)
     
-    # Create bulk items (using URL placeholders)
-    # In production, these would be actual signed URLs
-    items = [
-        {
-            "id": "student_001",
-            "image_url": "https://httpbin.org/image/jpeg"  # Sample placeholder
-        },
-        {
-            "id": "student_002",
-            "image_url": "https://httpbin.org/image/png"  # Sample placeholder
-        }
-    ]
-    
-    data = {
-        "items": json.dumps(items)
+    # Create batch request (using URL placeholders)
+    # In production, these would be actual image URLs
+    request_data = {
+        "sheets": [
+            {
+                "id": "student_001",
+                "image_url": "https://httpbin.org/image/jpeg"  # Sample placeholder
+            },
+            {
+                "id": "student_002",
+                "image_url": "https://httpbin.org/image/png"  # Sample placeholder
+            }
+        ]
     }
     
     print("⊘ Skipped - requires valid image URLs")
     print("  Example usage:")
-    print("  curl -X POST http://localhost:8000/parse-omr-bulk \\")
-    print("    -F 'items=[{\"id\":\"s1\",\"image_url\":\"https://...\"}]'")
+    print("  curl -X POST http://localhost:8000/process-batch \\")
+    print("    -H 'Content-Type: application/json' \\")
+    print("    -d '{\"sheets\":[{\"id\":\"s1\",\"image_url\":\"https://...\"}]}'")
     return None
 
 
@@ -147,7 +146,7 @@ def main():
     results.append(("Single Upload", test_single_upload()))
     results.append(("Single URL", test_single_url()))
     results.append(("Custom Config", test_custom_config()))
-    results.append(("Bulk Processing", test_bulk_processing()))
+    results.append(("Batch Processing", test_batch_processing()))
     
     # Summary
     print("\n" + "="*70)
