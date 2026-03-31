@@ -1,3 +1,9 @@
+[variables]
+DISPLAY = ":99"
+QT_QPA_PLATFORM = "offscreen"
+MPLBACKEND = "Agg"
+OPENCV_IO_ENABLE_OPENEXR = "0"
+
 [phases.setup]
 aptPkgs = [
     "libxcb1",

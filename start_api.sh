@@ -2,6 +2,12 @@
 
 # Start the OMRChecker API server
 
+# Headless display settings (no monitor required)
+export DISPLAY=:99
+export QT_QPA_PLATFORM=offscreen
+export MPLBACKEND=Agg
+export OPENCV_IO_ENABLE_OPENEXR=0
+
 # Activate virtual environment
 source venv/bin/activate
 
