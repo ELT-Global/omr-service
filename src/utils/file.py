@@ -13,9 +13,12 @@ def load_json(path, **rest):
     try:
         with open(path, "r") as f:
             loaded = json.load(f, **rest)
+    except FileNotFoundError:
+        logger.error(f"JSON file not found at: '{path}'")
+        raise
     except json.decoder.JSONDecodeError as error:
         logger.critical(f"Error when loading json file at: '{path}'\n{error}")
-        exit(1)
+        raise
     return loaded
 
 

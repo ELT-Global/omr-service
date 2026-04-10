@@ -13,12 +13,14 @@ import json
 import base64
 import binascii
 import asyncio
+import shutil
 from pathlib import Path
-from typing import Optional, List
+from typing import Optional, List, Dict
 
 import httpx
 import uvicorn
 from fastapi import FastAPI, File, Form, UploadFile, HTTPException
+from fastapi.openapi.utils import get_openapi
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator
 
@@ -43,13 +45,195 @@ No authentication required. All processing is synchronous and stateless.
 )
 
 
+# Documentation-only models for Swagger schema
+class FieldBlockSchema(BaseModel):
+    """Defines a rectangular group of answer fields (questions) on the OMR sheet.
+    Either `fieldType` OR (`bubbleValues` + `direction`) must be provided.
+    """
+    origin: List[int] = Field(
+        ...,
+        description="[x, y] pixel coordinates of the top-left corner of the first bubble in this block, relative to pageDimensions",
+    )
+    bubblesGap: float = Field(
+        ..., description="Gap in pixels between adjacent bubbles within a single label/question"
+    )
+    labelsGap: float = Field(
+        ..., description="Gap in pixels between adjacent labels (i.e. rows or columns of questions)"
+    )
+    fieldLabels: List[str] = Field(
+        ...,
+        description=(
+            "Question field label names. Supports compact range syntax: "
+            "'q1..10' expands to q1, q2, …, q10. "
+            "Labels listed here become keys in the answers response."
+        ),
+    )
+    fieldType: Optional[str] = Field(
+        None,
+        description=(
+            "Predefined question type shorthand. One of: "
+            "QTYPE_MCQ4 (bubbles A-D, horizontal), "
+            "QTYPE_MCQ5 (bubbles A-E, horizontal), "
+            "QTYPE_INT (digits 0-9, vertical), "
+            "QTYPE_INT_FROM_1 (digits 1-9 then 0, vertical). "
+            "Use this OR bubbleValues+direction, not both."
+        ),
+    )
+    bubbleValues: Optional[List[str]] = Field(
+        None,
+        description=(
+            "Custom list of answer values corresponding to each bubble position "
+            "(e.g. ['A','B','C','D'] or ['True','False']). "
+            "Must be paired with 'direction'. Use this OR fieldType, not both."
+        ),
+    )
+    direction: Optional[str] = Field(
+        None,
+        description="Bubble layout direction: 'horizontal' or 'vertical'. Required when using bubbleValues.",
+    )
+    bubbleDimensions: Optional[List[float]] = Field(
+        None,
+        description="[width, height] — override the global bubbleDimensions for this block only",
+    )
+    emptyValue: Optional[str] = Field(
+        None,
+        description="Value written when no bubble is detected in this block (overrides global emptyValue)",
+    )
+
+    model_config = {
+        "json_schema_extra": {
+            "examples": [
+                {
+                    "fieldType": "QTYPE_MCQ4",
+                    "origin": [134, 684],
+                    "fieldLabels": ["q1..10"],
+                    "bubblesGap": 79,
+                    "labelsGap": 62,
+                }
+            ]
+        }
+    }
+
+
+class PreProcessorConfig(BaseModel):
+    """A single image pre-processor applied before OMR bubble detection."""
+    name: str = Field(
+        ...,
+        description=(
+            "Pre-processor name. Supported values: "
+            "CropOnMarkers (align/crop using printed corner markers), "
+            "CropPage (auto-detect and crop the page boundary), "
+            "FeatureBasedAlignment (warp sheet to match a reference image), "
+            "GaussianBlur (reduce noise), "
+            "MedianBlur (reduce salt-and-pepper noise), "
+            "Levels (adjust brightness/contrast)."
+        ),
+    )
+    options: Dict[str, object] = Field(
+        ...,
+        description=(
+            "Options specific to the chosen pre-processor. "
+            "CropOnMarkers: relativePath (required), marker_rescale_range, marker_rescale_steps, min_matching_threshold. "
+            "CropPage: morphKernel ([w,h]). "
+            "FeatureBasedAlignment: reference (required), maxFeatures, goodMatchPercent, 2d. "
+            "GaussianBlur: kSize ([w,h]), sigmaX. "
+            "MedianBlur: kSize (integer). "
+            "Levels: low, high, gamma (all 0-1)."
+        ),
+    )
+
+
+class TemplateJsonSchema(BaseModel):
+    """Structure of the template.json that defines the OMR sheet layout.
+
+    Pass this as a JSON-encoded string in the `template_json` field of
+    `/process-sheet` (form) or `/process-batch` (JSON body).
+    All pixel coordinates are expressed in the coordinate space of `pageDimensions`.
+    """
+    pageDimensions: List[int] = Field(
+        ...,
+        description="[width, height] — the sheet is resized to these dimensions before any processing. All field block coordinates must be relative to this size.",
+    )
+    bubbleDimensions: List[int] = Field(
+        ...,
+        description="[width, height] — default size in pixels of each answer bubble. Can be overridden per field block.",
+    )
+    fieldBlocks: Dict[str, FieldBlockSchema] = Field(
+        ...,
+        description=(
+            "Named groups of adjacent answer fields. "
+            "Each key is an arbitrary descriptive block name (e.g. 'MCQBlock1', 'RollNumber'); "
+            "each value is a FieldBlockSchema describing that group's position and layout."
+        ),
+    )
+    preProcessors: Optional[List[PreProcessorConfig]] = Field(
+        None,
+        description="Ordered list of image pre-processors applied before bubble detection. Common use: CropPage to auto-detect page edges, then GaussianBlur to reduce noise.",
+    )
+    customLabels: Optional[Dict[str, List[str]]] = Field(
+        None,
+        description=(
+            "Composite answer labels. Maps a combined label name to an ordered list of sub-field labels "
+            "whose detected values are concatenated. Example: {'Roll': ['roll1..3']} joins roll1+roll2+roll3 "
+            "into a single 'Roll' entry in the answers response."
+        ),
+    )
+    emptyValue: Optional[str] = Field(
+        None,
+        description="Global default value used when no bubble is marked in a field. Defaults to empty string.",
+    )
+    outputColumns: Optional[List[str]] = Field(
+        None,
+        description="Ordered list of field label names to include in CSV output. When omitted, all labels are output in alphabetical order.",
+    )
+
+    model_config = {
+        "json_schema_extra": {
+            "examples": [
+                {
+                    "pageDimensions": [1189, 1682],
+                    "bubbleDimensions": [30, 30],
+                    "preProcessors": [
+                        {"name": "GaussianBlur", "options": {"kSize": [3, 3], "sigmaX": 0}},
+                        {"name": "CropPage", "options": {"morphKernel": [10, 10]}},
+                    ],
+                    "fieldBlocks": {
+                        "MCQBlock1": {
+                            "fieldType": "QTYPE_MCQ4",
+                            "origin": [134, 684],
+                            "fieldLabels": ["q1..11"],
+                            "bubblesGap": 79,
+                            "labelsGap": 62,
+                        }
+                    },
+                }
+            ]
+        }
+    }
+
+
 # Response models
 class OMRResult(BaseModel):
     """Result model for a single OMR sheet"""
     id: str = Field(..., description="Sheet identifier")
-    answers: dict = Field(..., description="Detected answers")
-    multi_marked_count: int = Field(..., description="Number of multi-marked questions")
-    error: Optional[str] = Field(None, description="Error message if processing failed")
+    answers: Dict[str, str] = Field(
+        ...,
+        description=(
+            "Detected answers keyed by field label name. "
+            "Values are the detected bubble answer strings: "
+            "'A'/'B'/'C'/'D' for MCQ4 fields, "
+            "'A'/'B'/'C'/'D'/'E' for MCQ5 fields, "
+            "a digit string ('0'–'9') for integer-type fields, "
+            "concatenated digits (e.g. '42') for customLabels that join multiple integer fields, "
+            "or empty string if no bubble was detected."
+        ),
+        examples=[{"q1": "A", "q2": "C", "q3": "B", "q4": "D", "Roll": "42"}],
+    )
+    multi_marked_count: int = Field(
+        ...,
+        description="Number of questions where multiple bubbles were marked simultaneously",
+    )
+    error: Optional[str] = Field(None, description="Error message if processing failed, null on success")
 
 
 class BatchRequest(BaseModel):
@@ -60,8 +244,21 @@ class BatchRequest(BaseModel):
         min_length=1,
         max_length=20
     )
-    config_json: Optional[str] = Field(None, description="Optional custom config.json as JSON string")
-    template_json: Optional[str] = Field(None, description="Optional custom template.json as JSON string")
+    config_json: Optional[str] = Field(
+        None,
+        description="Optional custom config.json as a JSON string. Controls processing thresholds and alignment parameters.",
+    )
+    template_json: Optional[str] = Field(
+        None,
+        description=(
+            "Optional custom template.json as a JSON string. "
+            "Defines the OMR sheet layout: page size, bubble dimensions, field block positions, and pre-processors. "
+            "See the TemplateJsonSchema model in the Schemas section below for the full structure and field descriptions."
+        ),
+        examples=[
+            '{"pageDimensions":[1189,1682],"bubbleDimensions":[30,30],"preProcessors":[{"name":"CropPage","options":{"morphKernel":[10,10]}}],"fieldBlocks":{"MCQBlock1":{"fieldType":"QTYPE_MCQ4","origin":[134,684],"fieldLabels":["q1..10"],"bubblesGap":79,"labelsGap":62}}}'
+        ],
+    )
 
     @field_validator('sheets')
     @classmethod
@@ -98,6 +295,84 @@ class BatchResponse(BaseModel):
     successful: int = Field(..., description="Number of successfully processed sheets")
     failed: int = Field(..., description="Number of failed sheets")
     results: List[OMRResult] = Field(..., description="Results for each sheet")
+
+
+# Inject TemplateJsonSchema (and sub-models) into the OpenAPI spec so that:
+# 1) They appear in the Swagger UI "Schemas" section at the bottom of /docs
+# 2) template_json string fields link to the schema via contentSchema
+def _build_inline_template_schema():
+    """Build a fully-resolved (no $refs) JSON Schema for TemplateJsonSchema."""
+    raw = TemplateJsonSchema.model_json_schema()
+    defs = raw.pop("$defs", {})
+
+    def _resolve(node):
+        if isinstance(node, dict):
+            if "$ref" in node:
+                ref_name = node["$ref"].rsplit("/", 1)[-1]
+                resolved = defs.get(ref_name, {})
+                return _resolve(resolved)
+            return {k: _resolve(v) for k, v in node.items()}
+        if isinstance(node, list):
+            return [_resolve(item) for item in node]
+        return node
+
+    return _resolve(raw)
+
+
+def _patch_template_json_field(schema_obj, inline_schema):
+    """Replace a plain string type with the full inline JSON structure."""
+    schema_obj["contentMediaType"] = "application/json"
+    schema_obj["contentSchema"] = inline_schema
+
+
+def _walk_and_patch(obj, inline_schema):
+    """Recursively find template_json properties in the OpenAPI spec and patch them."""
+    if isinstance(obj, dict):
+        props = obj.get("properties", {})
+        if "template_json" in props:
+            tj = props["template_json"]
+            if "anyOf" in tj:
+                for variant in tj["anyOf"]:
+                    if variant.get("type") == "string":
+                        _patch_template_json_field(variant, inline_schema)
+            elif tj.get("type") == "string":
+                _patch_template_json_field(tj, inline_schema)
+        for v in obj.values():
+            _walk_and_patch(v, inline_schema)
+    elif isinstance(obj, list):
+        for item in obj:
+            _walk_and_patch(item, inline_schema)
+
+
+def custom_openapi():
+    if app.openapi_schema:
+        return app.openapi_schema
+    openapi_schema = get_openapi(
+        title=app.title,
+        version=app.version,
+        description=app.description,
+        routes=app.routes,
+    )
+    # Build the fully-expanded template schema (no $ref indirection)
+    inline_schema = _build_inline_template_schema()
+
+    # Patch all template_json string fields with the full inline structure
+    _walk_and_patch(openapi_schema, inline_schema)
+
+    # Also register the models in components/schemas so they appear
+    # in Swagger UI's "Schemas" section at the bottom of /docs
+    schemas = openapi_schema.setdefault("components", {}).setdefault("schemas", {})
+    template_schema = TemplateJsonSchema.model_json_schema(
+        ref_template="#/components/schemas/{model}"
+    )
+    defs = template_schema.pop("$defs", {})
+    defs["TemplateJsonSchema"] = template_schema
+    schemas.update(defs)
+
+    app.openapi_schema = openapi_schema
+    return openapi_schema
+
+app.openapi = custom_openapi
 
 
 # Default configuration directory (can be overridden via environment variable)
@@ -220,6 +495,13 @@ def save_config_files(config_json: Optional[str], template_json: Optional[str]) 
     temp_dir = tempfile.mkdtemp()
     
     try:
+        # Copy assets from default config directory first
+        if DEFAULT_CONFIG_DIR.exists():
+            for item in os.listdir(DEFAULT_CONFIG_DIR):
+                s = DEFAULT_CONFIG_DIR / item
+                if os.path.isfile(s):
+                    shutil.copy2(s, temp_dir)
+
         if config_json:
             config_path = Path(temp_dir) / "config.json"
             config_data = json.loads(config_json)
@@ -242,7 +524,6 @@ def save_config_files(config_json: Optional[str], template_json: Optional[str]) 
 
 def cleanup_temp_files(*paths):
     """Clean up temporary files and directories"""
-    import shutil
     for path in paths:
         if path and os.path.exists(path):
             try:
@@ -280,8 +561,18 @@ async def process_sheet(
     image: Optional[UploadFile] = File(None, description="OMR sheet image file (JPG, PNG, etc.)"),
     image_url: Optional[str] = Form(None, description="URL of the OMR sheet image"),
     image_base64: Optional[str] = Form(None, description="Base64 encoded image data"),
-    config_json: Optional[str] = Form(None, description="Optional custom config.json as JSON string"),
-    template_json: Optional[str] = Form(None, description="Optional custom template.json as JSON string")
+    config_json: Optional[str] = Form(
+        None,
+        description="Optional custom config.json as a JSON string. Controls processing thresholds and alignment parameters.",
+    ),
+    template_json: Optional[str] = Form(
+        None,
+        description=(
+            "Optional custom template.json as a JSON string. "
+            "Defines the OMR sheet layout: page size, bubble dimensions, field block positions, and pre-processors. "
+            "See the TemplateJsonSchema model in the Schemas section below for the full structure and field descriptions."
+        ),
+    )
 ):
     """
     Process a single OMR sheet.

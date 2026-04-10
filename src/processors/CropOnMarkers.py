@@ -20,6 +20,8 @@ from src.logger import logger
 from src.processors.interfaces.ImagePreprocessor import ImagePreprocessor
 from src.utils.image import ImageUtils
 from src.utils.interaction import InteractionUtils
+from src.exceptions import ResourceNotFoundError
+
 
 
 class CropOnMarkers(ImagePreprocessor):
@@ -190,11 +192,10 @@ class CropOnMarkers(ImagePreprocessor):
 
     def load_marker(self, marker_ops, config):
         if not os.path.exists(self.marker_path):
-            logger.error(
-                "Marker not found at path provided in template:",
-                self.marker_path,
+            raise ResourceNotFoundError(
+                f"Marker not found at path provided in template: {self.marker_path}"
             )
-            exit(31)
+
 
         marker = cv2.imread(self.marker_path, cv2.IMREAD_GRAYSCALE)
 
